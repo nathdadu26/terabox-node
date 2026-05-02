@@ -3,20 +3,24 @@
 # ─────────────────────────────────────────────────────────────
 FROM node:20-slim AS node_builder
 
-RUN apt-get update && apt-get install -y --no-install-recommends git \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    git \
+    && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # pnpm install karo
 RUN npm install -g pnpm
 
-# terabox-node repo clone karo (aapka fork)
+# terabox-node repo clone karo
+# GIT_SSL_NO_VERIFY sirf build time ke liye — runtime pe nahi
 WORKDIR /terabox-node
-RUN git clone --depth 1 https://github.com/nathdadu26/terabox-node.git .
+RUN GIT_SSL_NO_VERIFY=1 git clone --depth 1 https://github.com/nathdadu26/terabox-node.git .
 
 # Dependencies install karo
 RUN pnpm install --frozen-lockfile || pnpm install
 
-# Global link karo taaki tb-* commands available ho jaaye
+# Global link karo
 RUN pnpm link --global
 
 # ─────────────────────────────────────────────────────────────
@@ -24,50 +28,46 @@ RUN pnpm link --global
 # ─────────────────────────────────────────────────────────────
 FROM python:3.11-slim
 
-# System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     aria2 \
     nodejs \
     npm \
     curl \
-    ca-certificates \
+    && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # pnpm install karo
 RUN npm install -g pnpm
 
-# terabox-node source copy karo Stage 1 se
+# terabox-node source + node_modules copy karo Stage 1 se
 COPY --from=node_builder /terabox-node /opt/terabox-node
 
-# node_modules bhi copy karo (Stage 1 mein install kiye the)
-COPY --from=node_builder /terabox-node/node_modules /opt/terabox-node/node_modules
-
-# Global link Stage 1 se copy karo
+# Global binaries copy karo Stage 1 se
 COPY --from=node_builder /usr/local/lib/node_modules /usr/local/lib/node_modules
-COPY --from=node_builder /usr/local/bin /usr/local/bin/node_bins
+COPY --from=node_builder /usr/local/bin /usr/local/bin/node_stage1
 
-# tb-* binaries ko PATH mein add karo
-RUN cp /usr/local/bin/node_bins/tb-* /usr/local/bin/ 2>/dev/null || true
-RUN rm -rf /usr/local/bin/node_bins
+# tb-* binaries ko PATH mein dalo
+RUN find /usr/local/bin/node_stage1 -name "tb-*" -exec cp {} /usr/local/bin/ \; 2>/dev/null || true \
+    && rm -rf /usr/local/bin/node_stage1
 
-# Fallback: agar pnpm link se nahi aaya to manually link karo
+# Fallback: pnpm link dobara karo
 WORKDIR /opt/terabox-node
 RUN pnpm link --global || true
 
-# Download directory banao
+# Download directory
 RUN mkdir -p /downloads && chmod 777 /downloads
 
-# tb config directory — .config.yaml yahaan hona chahiye
+# tb config directory
 RUN mkdir -p /root/.config/tb-getdl-share
 
-# Working directory
 WORKDIR /app
 
-# Python dependencies install karo
+# Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Bot files copy karo
+# Bot files
 COPY bot.py .
 COPY health_check.py .
 COPY start.sh .
