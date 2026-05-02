@@ -1,5 +1,4 @@
-# bot.py — TeraBox Telegram Bot
-# Ek hi file mein sab kuch: config, aria2, downloader, handlers, main
+# bot.py — TeraBox Telegram Bot (English, Full Featured)
 
 import asyncio
 import logging
@@ -81,8 +80,8 @@ async def _rpc(method: str, params: list = None):
                 data = await r.json(content_type=None)
     except aiohttp.ClientConnectorError:
         raise ConnectionError(
-            f"Aria2 se connect nahi ho pa raha: {ARIA2_URL}\n"
-            "`aria2c --enable-rpc` run karo."
+            f"Cannot connect to Aria2: {ARIA2_URL}\n"
+            "Make sure `aria2c --enable-rpc` is running."
         )
 
     if "error" in data:
@@ -133,7 +132,7 @@ async def aria2_all_gids() -> set:
     active, waiting, stopped = await asyncio.gather(
         _rpc("tellActive",  [["gid"]]),
         _rpc("tellWaiting", [0, 1000, ["gid"]]),
-        _rpc("tellStopped", [0, 1000, ["gid"]]),  # completed GIDs bhi check karo
+        _rpc("tellStopped", [0, 1000, ["gid"]]),
     )
     return {d["gid"] for d in (active + waiting + stopped)}
 
@@ -167,6 +166,25 @@ def eta_str(done: int, total: int, speed: int) -> str:
     if secs < 3600: return f"{secs//60}m {secs%60}s"
     return f"{secs//3600}h {(secs%3600)//60}m"
 
+def delete_file(path: str):
+    """Safely delete a file from disk."""
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+            log.info("🗑️  Deleted temp file: %s", path)
+    except Exception as e:
+        log.warning("Could not delete file %s: %s", path, e)
+
+URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+
+def extract_links(text: str) -> list[str]:
+    """Extract all URLs from a text string."""
+    if not text:
+        return []
+    return URL_RE.findall(text)
+
+VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".m4v", ".ts"}
+
 # ─────────────────────────────────────────────────────────────
 # 4. DOWNLOADER
 # ─────────────────────────────────────────────────────────────
@@ -180,7 +198,7 @@ class DownloadResult:
 
 
 async def _run_tb(share_url: str):
-    """tb-getdl-share JS command chalao subprocess mein."""
+    """Run tb-getdl-share subprocess."""
     cmd = ["tb-getdl-share", "-a", TB_ACCOUNT, "-s", share_url]
     log.info("Running: %s", " ".join(cmd))
 
@@ -198,26 +216,25 @@ async def _run_tb(share_url: str):
 
     if proc.returncode not in (0, None):
         raise RuntimeError(
-            f"tb-getdl-share exit code {proc.returncode}"
-            + (f"\n{err}" if err else "")
+            f"tb-getdl-share failed (exit code {proc.returncode})"
+            + (f"\n{err.strip()}" if err.strip() else "")
         )
 
 
 async def _find_new_gid(before: set, timeout: float = 60.0) -> str:
-    """Command ke baad Aria2 mein naya GID dhundo."""
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
-        await asyncio.sleep(0.5)  # faster polling
+        await asyncio.sleep(0.5)
         current = await aria2_all_gids()
         new = current - before
         if new:
             gid = next(iter(new))
-            log.info("Naya GID mila: %s", gid)
+            log.info("New GID found: %s", gid)
             return gid
     raise RuntimeError(
-        "Aria2 mein naya download nahi mila!\n"
-        "• Link invalid ho sakta hai\n"
-        "• .config.yaml mein account check karo"
+        "No new download appeared in Aria2!\n"
+        "• The link may be invalid or expired\n"
+        "• Check your account config"
     )
 
 
@@ -241,7 +258,7 @@ async def download(
             try:
                 await on_progress(s)
             except Exception as e:
-                log.warning("Progress cb error: %s", e)
+                log.warning("Progress callback error: %s", e)
             last_cb = now
 
         log.info("GID=%s | %s | %.1f%% | %s | %s",
@@ -250,7 +267,7 @@ async def download(
 
         if s.status == "complete":
             if not s.files:
-                raise RuntimeError("Aria2 ne file path nahi diya!")
+                raise RuntimeError("Aria2 did not return a file path!")
             path = s.files[0].path
             return DownloadResult(
                 gid=gid,
@@ -259,20 +276,15 @@ async def download(
                 total_size=s.total_length,
             )
         if s.status == "error":
-            raise RuntimeError(f"Aria2 download failed: {s.error_message or 'Unknown error'}")
+            raise RuntimeError(f"Aria2 download error: {s.error_message or 'Unknown error'}")
         if s.status == "removed":
-            raise RuntimeError("Download Aria2 se remove kar diya gaya!")
+            raise RuntimeError("Download was removed from Aria2!")
 
         await asyncio.sleep(2)
 
 # ─────────────────────────────────────────────────────────────
-# 5. BOT HANDLERS
+# 5. CORE PROCESSOR
 # ─────────────────────────────────────────────────────────────
-
-URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
-
-VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".m4v", ".ts"}
-
 
 async def safe_edit(msg: Message, text: str):
     try:
@@ -286,8 +298,188 @@ async def safe_edit(msg: Message, text: str):
             await asyncio.sleep(wait + 1)
             await safe_edit(msg, text)
         else:
-            log.error("edit error: %s", e)
+            log.error("Edit error: %s", e)
 
+
+async def process_single_link(
+    client: Client,
+    original_message: Message,
+    status_msg: Message,
+    link: str,
+    link_index: int,
+    total_links: int,
+) -> bool:
+    """
+    Process one link. Returns True on success, False on failure.
+    status_msg is edited in-place to show progress.
+    """
+    prefix = f"**[{link_index}/{total_links}]** " if total_links > 1 else ""
+
+    # Check Aria2
+    try:
+        await aria2_ping()
+    except Exception as e:
+        await safe_edit(status_msg,
+            f"{prefix}❌ **Cannot connect to Aria2!**\n\n"
+            f"`{e}`\n\n"
+            f"Please try again later."
+        )
+        return False
+
+    await safe_edit(status_msg,
+        f"{prefix}📡 **Processing link...**\n"
+        f"`{link[:60]}{'...' if len(link) > 60 else ''}`"
+    )
+
+    # Progress callback
+    async def on_progress(s: Aria2Status):
+        bar = progress_bar(s.percent)
+        eta = eta_str(s.completed_length, s.total_length, s.download_speed)
+        await safe_edit(status_msg,
+            f"{prefix}⬇️ **Downloading...**\n\n"
+            f"`{bar}` {s.percent:.1f}%\n\n"
+            f"📦 `{fmt_bytes(s.completed_length)}` / `{fmt_bytes(s.total_length)}`\n"
+            f"⚡ Speed: `{fmt_speed(s.download_speed)}`\n"
+            f"⏱ ETA: `{eta}`\n\n"
+            f"_GID: {s.gid}_"
+        )
+
+    # Download
+    result = None
+    try:
+        result = await download(link, on_progress)
+    except RuntimeError as e:
+        log.error("Download failed for %s: %s", link, e)
+        await safe_edit(status_msg,
+            f"{prefix}❌ **Download Failed**\n\n"
+            f"**Reason:** `{e}`\n\n"
+            f"**Link:** `{link[:80]}`\n\n"
+            f"Please check if the link is valid and try again."
+        )
+        return False
+    except Exception as e:
+        log.exception("Unexpected error downloading %s", link)
+        await safe_edit(status_msg,
+            f"{prefix}❌ **Unexpected Error**\n\n"
+            f"`{type(e).__name__}: {e}`"
+        )
+        return False
+
+    # Upload to channel
+    await safe_edit(status_msg,
+        f"{prefix}✅ **Download Complete!**\n\n"
+        f"📁 `{result.file_name}`\n"
+        f"📦 `{fmt_bytes(result.total_size)}`\n\n"
+        f"📤 Uploading to channel..."
+    )
+
+    channel_msg = None
+    try:
+        ext = os.path.splitext(result.file_name)[1].lower()
+        caption = (
+            f"📁 **{result.file_name}**\n"
+            f"📦 `{fmt_bytes(result.total_size)}`"
+        )
+        if ext in VIDEO_EXTS:
+            channel_msg = await client.send_video(
+                CHANNEL_ID, result.file_path,
+                caption=caption, supports_streaming=True,
+            )
+        else:
+            channel_msg = await client.send_document(
+                CHANNEL_ID, result.file_path,
+                caption=caption,
+            )
+    except Exception as e:
+        log.exception("Upload failed for %s", result.file_name)
+        await safe_edit(status_msg,
+            f"{prefix}✅ Downloaded\n"
+            f"❌ **Upload Failed**\n\n"
+            f"**Error:** `{e}`\n\n"
+            f"**File:** `{result.file_name}`\n"
+            f"**Path:** `{result.file_path}`"
+        )
+        delete_file(result.file_path)
+        return False
+    finally:
+        # Always delete temp file after upload attempt
+        if result:
+            delete_file(result.file_path)
+
+    # Copy to user (reply to original message)
+    await safe_edit(status_msg,
+        f"{prefix}✅ **Done!**\n"
+        f"📁 `{result.file_name}`\n\n"
+        f"File incoming 👇"
+    )
+    try:
+        await client.copy_message(
+            original_message.chat.id,
+            CHANNEL_ID,
+            channel_msg.id,
+            reply_to_message_id=original_message.id,
+        )
+        log.info("Delivered to user %d: %s", original_message.from_user.id, result.file_name)
+    except Exception as e:
+        log.exception("Copy failed for %s", result.file_name)
+        await original_message.reply_text(
+            f"❌ **Could not deliver file**\n\n`{e}`",
+            reply_to_message_id=original_message.id,
+        )
+        return False
+
+    return True
+
+
+async def handle_links(client: Client, message: Message, links: list[str]):
+    """Process a list of links sequentially, one status message per batch."""
+    user = message.from_user
+    log.info("User %s (%d) sent %d link(s)", user.username or user.first_name, user.id, len(links))
+
+    if not links:
+        return
+
+    # Single status message for all links
+    status_msg = await message.reply_text(
+        f"🔍 Found **{len(links)}** link(s). Starting...",
+        reply_to_message_id=message.id,
+        disable_web_page_preview=True,
+    )
+
+    success = 0
+    failed = 0
+
+    for i, link in enumerate(links, 1):
+        ok = await process_single_link(
+            client, message, status_msg, link, i, len(links)
+        )
+        if ok:
+            success += 1
+        else:
+            failed += 1
+
+        # Small gap between links
+        if i < len(links):
+            await asyncio.sleep(2)
+
+    # Final summary if multiple links
+    if len(links) > 1:
+        summary = f"✅ **All done!**\n\n"
+        summary += f"✅ Success: **{success}**\n"
+        if failed:
+            summary += f"❌ Failed: **{failed}**\n"
+        summary += f"📊 Total: **{len(links)}**"
+        await safe_edit(status_msg, summary)
+    else:
+        # For single link, delete status after delivery
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+# ─────────────────────────────────────────────────────────────
+# 6. BOT HANDLERS
+# ─────────────────────────────────────────────────────────────
 
 def register(app: Client):
 
@@ -295,12 +487,15 @@ def register(app: Client):
     async def cmd_start(_, message: Message):
         await message.reply_text(
             "🤖 **TeraBox Downloader Bot**\n\n"
-            "Koi bhi shared link bhejo!\n\n"
-            "➤ File download hogi\n"
-            "➤ Private channel mein save hogi\n"
-            "➤ Aapko copy karke dunga 📁\n\n"
-            "**Example:**\n`https://terabox.com/s/xxxxxxxxxx`\n\n"
-            "/status — Aria2 ka haal poocho"
+            "Send any TeraBox / cloud share link and I'll download it for you!\n\n"
+            "**Supported:**\n"
+            "➤ Text messages with links\n"
+            "➤ Media (photo/video/doc) with links in caption\n"
+            "➤ Multiple links in one message — all processed!\n\n"
+            "**Example:**\n"
+            "`https://terabox.com/s/xxxxxxxxxx`\n\n"
+            "/status — Check Aria2 status",
+            reply_to_message_id=message.id,
         )
 
     @app.on_message(filters.command("status") & filters.private)
@@ -313,103 +508,49 @@ def register(app: Client):
                 f"Version: `{ver['version']}`\n\n"
                 f"🔄 Active: `{stat['numActive']}`\n"
                 f"⏳ Waiting: `{stat['numWaiting']}`\n"
-                f"⚡ Speed: `{fmt_speed(int(stat['downloadSpeed']))}`"
+                f"⚡ Speed: `{fmt_speed(int(stat['downloadSpeed']))}`",
+                reply_to_message_id=message.id,
             )
         except Exception as e:
-            await message.reply_text(f"❌ **Aria2 offline hai!**\n`{e}`")
-
-    @app.on_message(filters.text & filters.private & ~filters.command(["start", "status"]))
-    async def on_link(client: Client, message: Message):
-        match = URL_RE.search(message.text or "")
-        if not match:
             await message.reply_text(
-                "❌ Koi valid URL nahi mila.\n"
-                "Format: `https://example.com/...`"
-            )
-            return
-
-        link = match.group(0)
-        user = message.from_user
-        log.info("User %s (%d): %s", user.username or user.first_name, user.id, link)
-
-        status_msg = await message.reply_text("🔍 **Link mila!** Shuru ho raha hai...")
-
-        # Aria2 check
-        try:
-            await aria2_ping()
-        except Exception as e:
-            await safe_edit(status_msg,
-                f"❌ **Aria2 se connect nahi ho pa raha!**\n\n`{e}`")
-            return
-
-        await safe_edit(status_msg, "📡 **Aria2 connected!**\nLink process ho raha hai...")
-
-        # Progress callback
-        async def on_progress(s: Aria2Status):
-            bar = progress_bar(s.percent)
-            eta = eta_str(s.completed_length, s.total_length, s.download_speed)
-            await safe_edit(status_msg,
-                f"⬇️ **Download Ho Raha Hai...**\n\n"
-                f"`{bar}` {s.percent:.1f}%\n\n"
-                f"📦 `{fmt_bytes(s.completed_length)}` / `{fmt_bytes(s.total_length)}`\n"
-                f"⚡ Speed: `{fmt_speed(s.download_speed)}`\n"
-                f"⏱ ETA: `{eta}`\n\n"
-                f"_GID: {s.gid}_"
+                f"❌ **Aria2 is offline!**\n\n`{e}`",
+                reply_to_message_id=message.id,
             )
 
-        # Download
-        try:
-            result = await download(link, on_progress)
-        except Exception as e:
-            log.exception("Download failed")
-            await safe_edit(status_msg, f"❌ **Download fail ho gaya!**\n\n`{e}`")
-            return
-
-        # Upload to channel
-        await safe_edit(status_msg,
-            f"✅ **Download Complete!**\n\n"
-            f"📁 `{result.file_name}`\n"
-            f"📦 `{fmt_bytes(result.total_size)}`\n\n"
-            f"📤 Channel pe upload ho raha hai..."
-        )
-
-        try:
-            ext = os.path.splitext(result.file_name)[1].lower()
-            caption = (
-                f"📁 **{result.file_name}**\n"
-                f"📦 `{fmt_bytes(result.total_size)}`"
-            )
-            if ext in VIDEO_EXTS:
-                channel_msg = await client.send_video(
-                    CHANNEL_ID, result.file_path,
-                    caption=caption, supports_streaming=True,
-                )
-            else:
-                channel_msg = await client.send_document(
-                    CHANNEL_ID, result.file_path,
-                    caption=caption,
-                )
-        except Exception as e:
-            log.exception("Upload failed")
-            await safe_edit(status_msg,
-                f"✅ Download hua\n❌ **Upload fail:**\n`{e}`\n\n"
-                f"Path: `{result.file_path}`"
+    # ── Text messages ──────────────────────────────────────────
+    @app.on_message(filters.text & filters.private & ~filters.command(["start", "status"]))
+    async def on_text(client: Client, message: Message):
+        links = extract_links(message.text or "")
+        if not links:
+            await message.reply_text(
+                "❌ **No valid URL found.**\n\n"
+                "Please send a direct download link.\n"
+                "Example: `https://terabox.com/s/...`",
+                reply_to_message_id=message.id,
             )
             return
+        await handle_links(client, message, links)
 
-        # Copy to user
-        await safe_edit(status_msg,
-            f"✅ **Sab ho gaya!**\n📁 `{result.file_name}`\n\nFile neeche aa rahi hai 👇"
-        )
-        try:
-            await client.copy_message(message.chat.id, CHANNEL_ID, channel_msg.id)
-            log.info("User %d ko copy kar di: %s", user.id, result.file_name)
-        except Exception as e:
-            log.exception("Copy failed")
-            await message.reply_text(f"❌ Copy nahi ho pa raha:\n`{e}`")
+    # ── Media messages (photo / video / document / audio) ─────
+    @app.on_message(
+        filters.private &
+        (filters.photo | filters.video | filters.document | filters.audio) &
+        ~filters.command(["start", "status"])
+    )
+    async def on_media(client: Client, message: Message):
+        caption = message.caption or ""
+        links = extract_links(caption)
+        if not links:
+            await message.reply_text(
+                "❌ **No URL found in caption.**\n\n"
+                "Please include a download link in the media caption.",
+                reply_to_message_id=message.id,
+            )
+            return
+        await handle_links(client, message, links)
 
 # ─────────────────────────────────────────────────────────────
-# 6. MAIN
+# 7. MAIN
 # ─────────────────────────────────────────────────────────────
 
 async def main():
@@ -447,4 +588,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        log.info("Bot band ho raha hai...")
+        log.info("Bot shutting down...")
