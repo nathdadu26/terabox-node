@@ -1,5 +1,9 @@
 accounts:
   main: YdPyKX9peHuinxRuTf8vacKHtawBt5mvF7f6PyEF
+  second: Yq7jmdPpeHuigTSYdsqcWqG9kfHILhR4COg5ZAHG
+  third: YSNonL8peHui7n2YoevtOav36hgKkAM3D6CAhGqi
+  fourth: Y-plydNpeHuimxsPjFeCt0tNUWEqDz3OFy2YP_nH
+  fifth: YQFOiBPpeHuiiGmkt1obwmT1YVLVVb8J3jbVd-__
 aria2:
   url: http://localhost:6800/jsonrpc
   secret: YOUR_ARIA2_RPC_SECRET
