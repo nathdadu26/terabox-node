@@ -29,10 +29,16 @@ BOT_TOKEN         = _req("BOT_TOKEN")
 API_ID            = int(_req("API_ID"))
 API_HASH          = _req("API_HASH")
 CHANNEL_ID        = int(_req("CHANNEL_ID"))
-TB_ACCOUNT        = os.getenv("TB_ACCOUNT", "")
 ARIA2_URL         = os.getenv("ARIA2_URL", "http://localhost:6800/jsonrpc")
 ARIA2_SECRET      = os.getenv("ARIA2_SECRET", "")
 PROGRESS_INTERVAL = int(os.getenv("PROGRESS_INTERVAL", "5"))
+
+# ── Account rotation ──────────────────────────────────────────
+# TB_ACCOUNTS = "main,second,third,fourth,fifth"  (comma separated)
+# Fallback: TB_ACCOUNT = "main"  (old single-account env)
+_accounts_raw = os.getenv("TB_ACCOUNTS", "") or os.getenv("TB_ACCOUNT", "main")
+TB_ACCOUNTS: list[str] = [a.strip() for a in _accounts_raw.split(",") if a.strip()]
+log_placeholder = None  # set after logging init
 
 # ─────────────────────────────────────────────────────────────
 # 1. LOGGING
@@ -52,7 +58,13 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 logging.getLogger("aiohttp").setLevel(logging.WARNING)
 
 # ─────────────────────────────────────────────────────────────
-# 2. ARIA2 RPC CLIENT
+# 2. UPLOAD LOCK  (one upload at a time — Telegram limit)
+# ─────────────────────────────────────────────────────────────
+
+_upload_lock = asyncio.Lock()
+
+# ─────────────────────────────────────────────────────────────
+# 3. ARIA2 RPC CLIENT
 # ─────────────────────────────────────────────────────────────
 
 _rpc_id = 0
@@ -140,7 +152,7 @@ async def aria2_status(gid: str) -> Aria2Status:
     return _parse(await _rpc("tellStatus", [gid]))
 
 # ─────────────────────────────────────────────────────────────
-# 3. UTILS
+# 4. UTILS
 # ─────────────────────────────────────────────────────────────
 
 def fmt_bytes(b: int) -> str:
@@ -167,7 +179,6 @@ def eta_str(done: int, total: int, speed: int) -> str:
     return f"{secs//3600}h {(secs%3600)//60}m"
 
 def delete_file(path: str):
-    """Safely delete a file from disk."""
     try:
         if path and os.path.exists(path):
             os.remove(path)
@@ -177,8 +188,10 @@ def delete_file(path: str):
 
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
+# Error #400141 — account rate limited / needs rotation
+ERROR_400141_RE = re.compile(r"Error\s*#?400141", re.IGNORECASE)
+
 def extract_links(text: str) -> list[str]:
-    """Extract all URLs from a text string."""
     if not text:
         return []
     return URL_RE.findall(text)
@@ -186,7 +199,7 @@ def extract_links(text: str) -> list[str]:
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".m4v", ".ts"}
 
 # ─────────────────────────────────────────────────────────────
-# 4. DOWNLOADER
+# 5. DOWNLOADER  (with account rotation on 400141)
 # ─────────────────────────────────────────────────────────────
 
 @dataclass
@@ -197,9 +210,20 @@ class DownloadResult:
     total_size: int
 
 
-async def _run_tb(share_url: str):
-    """Run tb-getdl-share subprocess."""
-    cmd = ["tb-getdl-share", "-a", TB_ACCOUNT, "-s", share_url]
+class AccountRotationError(Exception):
+    """Raised when all accounts fail with error 400141."""
+    pass
+
+
+async def _run_tb(share_url: str, account: str) -> str:
+    """
+    Run tb-getdl-share for a given account.
+    Returns combined stderr output.
+    Raises RuntimeError on non-zero exit.
+    Special: raises ValueError with '400141' if that specific error is detected,
+             so the caller can rotate accounts.
+    """
+    cmd = ["tb-getdl-share", "-a", account, "-s", share_url]
     log.info("Running: %s", " ".join(cmd))
 
     proc = await asyncio.create_subprocess_exec(
@@ -211,14 +235,21 @@ async def _run_tb(share_url: str):
 
     out = stdout.decode(errors="replace")
     err = stderr.decode(errors="replace")
+    combined = (out + "\n" + err).strip()
+
     if out.strip(): log.info("[tb stdout] %s", out.strip())
     if err.strip(): log.warning("[tb stderr] %s", err.strip())
 
     if proc.returncode not in (0, None):
+        # Check for error 400141 specifically
+        if ERROR_400141_RE.search(combined):
+            raise ValueError(f"400141: Account '{account}' hit error #400141")
         raise RuntimeError(
-            f"tb-getdl-share failed (exit code {proc.returncode})"
+            f"tb-getdl-share failed (exit {proc.returncode}) with account '{account}'"
             + (f"\n{err.strip()}" if err.strip() else "")
         )
+
+    return combined
 
 
 async def _find_new_gid(before: set, timeout: float = 60.0) -> str:
@@ -238,52 +269,91 @@ async def _find_new_gid(before: set, timeout: float = 60.0) -> str:
     )
 
 
-async def download(
+async def download_with_rotation(
     share_url: str,
     on_progress: Optional[Callable[[Aria2Status], Awaitable[None]]] = None,
+    on_account_switch: Optional[Callable[[str, str, int, int], Awaitable[None]]] = None,
 ) -> DownloadResult:
-    before = await aria2_all_gids()
-    log.info("GIDs before: %d", len(before))
+    """
+    Try each TB account in order.
+    Only rotates on error #400141 — other errors raise immediately.
+    on_account_switch(old_account, new_account, attempt, total) callback for UI updates.
+    """
+    accounts = TB_ACCOUNTS
+    if not accounts:
+        raise RuntimeError("No TB accounts configured! Set TB_ACCOUNTS env variable.")
 
-    await _run_tb(share_url)
+    last_error = None
 
-    gid = await _find_new_gid(before)
+    for attempt, account in enumerate(accounts, 1):
+        before = await aria2_all_gids()
+        log.info("Trying account '%s' (%d/%d) for: %s", account, attempt, len(accounts), share_url)
 
-    last_cb = 0.0
-    while True:
-        s = await aria2_status(gid)
-        now = asyncio.get_event_loop().time()
+        try:
+            await _run_tb(share_url, account)
+        except ValueError as e:
+            # Error 400141 — rotate to next account
+            last_error = str(e)
+            log.warning("Account '%s' got error 400141, rotating... (%d/%d)", account, attempt, len(accounts))
 
-        if on_progress and (now - last_cb) >= PROGRESS_INTERVAL:
-            try:
-                await on_progress(s)
-            except Exception as e:
-                log.warning("Progress callback error: %s", e)
-            last_cb = now
+            if attempt < len(accounts):
+                next_account = accounts[attempt]  # attempt is 1-based, so this is next index
+                if on_account_switch:
+                    try:
+                        await on_account_switch(account, next_account, attempt, len(accounts))
+                    except Exception:
+                        pass
+                continue  # try next account
+            else:
+                raise AccountRotationError(
+                    f"All {len(accounts)} account(s) failed with error #400141.\n"
+                    f"Please try again later or add more accounts."
+                )
+        except RuntimeError:
+            # Any other error — don't rotate, raise immediately
+            raise
 
-        log.info("GID=%s | %s | %.1f%% | %s | %s",
-                 gid, s.status, s.percent,
-                 fmt_bytes(s.completed_length), fmt_speed(s.download_speed))
+        # tb-getdl-share succeeded — now wait for GID and download
+        gid = await _find_new_gid(before)
 
-        if s.status == "complete":
-            if not s.files:
-                raise RuntimeError("Aria2 did not return a file path!")
-            path = s.files[0].path
-            return DownloadResult(
-                gid=gid,
-                file_path=path,
-                file_name=path.split("/")[-1],
-                total_size=s.total_length,
-            )
-        if s.status == "error":
-            raise RuntimeError(f"Aria2 download error: {s.error_message or 'Unknown error'}")
-        if s.status == "removed":
-            raise RuntimeError("Download was removed from Aria2!")
+        last_cb = 0.0
+        while True:
+            s = await aria2_status(gid)
+            now = asyncio.get_event_loop().time()
 
-        await asyncio.sleep(2)
+            if on_progress and (now - last_cb) >= PROGRESS_INTERVAL:
+                try:
+                    await on_progress(s)
+                except Exception as e:
+                    log.warning("Progress callback error: %s", e)
+                last_cb = now
+
+            log.info("GID=%s | %s | %.1f%% | %s | %s",
+                     gid, s.status, s.percent,
+                     fmt_bytes(s.completed_length), fmt_speed(s.download_speed))
+
+            if s.status == "complete":
+                if not s.files:
+                    raise RuntimeError("Aria2 did not return a file path!")
+                path = s.files[0].path
+                log.info("Download complete via account '%s': %s", account, path)
+                return DownloadResult(
+                    gid=gid,
+                    file_path=path,
+                    file_name=path.split("/")[-1],
+                    total_size=s.total_length,
+                )
+            if s.status == "error":
+                raise RuntimeError(f"Aria2 download error: {s.error_message or 'Unknown error'}")
+            if s.status == "removed":
+                raise RuntimeError("Download was removed from Aria2!")
+
+            await asyncio.sleep(2)
+
+    raise AccountRotationError(f"All accounts exhausted. Last error: {last_error}")
 
 # ─────────────────────────────────────────────────────────────
-# 5. CORE PROCESSOR
+# 6. CORE PROCESSOR
 # ─────────────────────────────────────────────────────────────
 
 async def safe_edit(msg: Message, text: str):
@@ -309,10 +379,6 @@ async def process_single_link(
     link_index: int,
     total_links: int,
 ) -> bool:
-    """
-    Process one link. Returns True on success, False on failure.
-    status_msg is edited in-place to show progress.
-    """
     prefix = f"**[{link_index}/{total_links}]** " if total_links > 1 else ""
 
     # Check Aria2
@@ -344,10 +410,26 @@ async def process_single_link(
             f"_GID: {s.gid}_"
         )
 
-    # Download
+    # Account switch callback
+    async def on_account_switch(old: str, new: str, attempt: int, total: int):
+        await safe_edit(status_msg,
+            f"{prefix}🔄 **Switching account...**\n\n"
+            f"Account `{old}` hit error #400141\n"
+            f"Trying account `{new}` ({attempt + 1}/{total})..."
+        )
+
+    # Download (with account rotation)
     result = None
     try:
-        result = await download(link, on_progress)
+        result = await download_with_rotation(link, on_progress, on_account_switch)
+    except AccountRotationError as e:
+        log.error("All accounts failed for %s: %s", link, e)
+        await safe_edit(status_msg,
+            f"{prefix}❌ **All Accounts Failed**\n\n"
+            f"`{e}`\n\n"
+            f"Please try again later."
+        )
+        return False
     except RuntimeError as e:
         log.error("Download failed for %s: %s", link, e)
         await safe_edit(status_msg,
@@ -365,48 +447,51 @@ async def process_single_link(
         )
         return False
 
-    # Upload to channel
+    # Upload to channel — sequential lock (one at a time)
     await safe_edit(status_msg,
         f"{prefix}✅ **Download Complete!**\n\n"
         f"📁 `{result.file_name}`\n"
         f"📦 `{fmt_bytes(result.total_size)}`\n\n"
-        f"📤 Uploading to channel..."
+        f"⏳ Waiting for upload slot..."
     )
 
     channel_msg = None
-    try:
-        ext = os.path.splitext(result.file_name)[1].lower()
-        caption = (
-            f"📁 **{result.file_name}**\n"
+    async with _upload_lock:
+        await safe_edit(status_msg,
+            f"{prefix}📤 **Uploading to channel...**\n\n"
+            f"📁 `{result.file_name}`\n"
             f"📦 `{fmt_bytes(result.total_size)}`"
         )
-        if ext in VIDEO_EXTS:
-            channel_msg = await client.send_video(
-                CHANNEL_ID, result.file_path,
-                caption=caption, supports_streaming=True,
+        try:
+            ext = os.path.splitext(result.file_name)[1].lower()
+            caption = (
+                f"📁 **{result.file_name}**\n"
+                f"📦 `{fmt_bytes(result.total_size)}`"
             )
-        else:
-            channel_msg = await client.send_document(
-                CHANNEL_ID, result.file_path,
-                caption=caption,
+            if ext in VIDEO_EXTS:
+                channel_msg = await client.send_video(
+                    CHANNEL_ID, result.file_path,
+                    caption=caption, supports_streaming=True,
+                )
+            else:
+                channel_msg = await client.send_document(
+                    CHANNEL_ID, result.file_path,
+                    caption=caption,
+                )
+        except Exception as e:
+            log.exception("Upload failed for %s", result.file_name)
+            await safe_edit(status_msg,
+                f"{prefix}✅ Downloaded\n"
+                f"❌ **Upload Failed**\n\n"
+                f"**Error:** `{e}`\n\n"
+                f"**File:** `{result.file_name}`"
             )
-    except Exception as e:
-        log.exception("Upload failed for %s", result.file_name)
-        await safe_edit(status_msg,
-            f"{prefix}✅ Downloaded\n"
-            f"❌ **Upload Failed**\n\n"
-            f"**Error:** `{e}`\n\n"
-            f"**File:** `{result.file_name}`\n"
-            f"**Path:** `{result.file_path}`"
-        )
-        delete_file(result.file_path)
-        return False
-    finally:
-        # Always delete temp file after upload attempt
-        if result:
+            delete_file(result.file_path)
+            return False
+        finally:
             delete_file(result.file_path)
 
-    # Copy to user (reply to original message)
+    # Copy to user
     await safe_edit(status_msg,
         f"{prefix}✅ **Done!**\n"
         f"📁 `{result.file_name}`\n\n"
@@ -432,14 +517,12 @@ async def process_single_link(
 
 
 async def handle_links(client: Client, message: Message, links: list[str]):
-    """Process a list of links sequentially, one status message per batch."""
     user = message.from_user
     log.info("User %s (%d) sent %d link(s)", user.username or user.first_name, user.id, len(links))
 
     if not links:
         return
 
-    # Single status message for all links
     status_msg = await message.reply_text(
         f"🔍 Found **{len(links)}** link(s). Starting...",
         reply_to_message_id=message.id,
@@ -447,54 +530,52 @@ async def handle_links(client: Client, message: Message, links: list[str]):
     )
 
     success = 0
-    failed = 0
+    failed  = 0
 
     for i, link in enumerate(links, 1):
-        ok = await process_single_link(
-            client, message, status_msg, link, i, len(links)
-        )
+        ok = await process_single_link(client, message, status_msg, link, i, len(links))
         if ok:
             success += 1
         else:
             failed += 1
 
-        # Small gap between links
         if i < len(links):
             await asyncio.sleep(2)
 
-    # Final summary if multiple links
     if len(links) > 1:
-        summary = f"✅ **All done!**\n\n"
+        summary  = f"✅ **All done!**\n\n"
         summary += f"✅ Success: **{success}**\n"
         if failed:
             summary += f"❌ Failed: **{failed}**\n"
         summary += f"📊 Total: **{len(links)}**"
         await safe_edit(status_msg, summary)
     else:
-        # For single link, delete status after delivery
         try:
             await status_msg.delete()
         except Exception:
             pass
 
 # ─────────────────────────────────────────────────────────────
-# 6. BOT HANDLERS
+# 7. BOT HANDLERS
 # ─────────────────────────────────────────────────────────────
 
 def register(app: Client):
 
     @app.on_message(filters.command("start") & filters.private)
     async def cmd_start(_, message: Message):
+        accounts_info = f"`{'`, `'.join(TB_ACCOUNTS)}`" if TB_ACCOUNTS else "_none configured_"
         await message.reply_text(
             "🤖 **TeraBox Downloader Bot**\n\n"
-            "Send any TeraBox / cloud share link and I'll download it for you!\n\n"
+            "Send any TeraBox / cloud share link!\n\n"
             "**Supported:**\n"
             "➤ Text messages with links\n"
-            "➤ Media (photo/video/doc) with links in caption\n"
-            "➤ Multiple links in one message — all processed!\n\n"
+            "➤ Media with links in caption\n"
+            "➤ Multiple links — all processed!\n"
+            "➤ Auto account rotation on errors\n\n"
+            f"**Active accounts:** {accounts_info}\n\n"
             "**Example:**\n"
             "`https://terabox.com/s/xxxxxxxxxx`\n\n"
-            "/status — Check Aria2 status",
+            "/status — Check Aria2 & accounts",
             reply_to_message_id=message.id,
         )
 
@@ -503,12 +584,16 @@ def register(app: Client):
         try:
             ver  = await aria2_ping()
             stat = await aria2_global_stat()
+            accounts_info = "\n".join(
+                f"  `{i+1}.` `{a}`" for i, a in enumerate(TB_ACCOUNTS)
+            ) or "  _none configured_"
             await message.reply_text(
                 f"✅ **Aria2 Online**\n"
                 f"Version: `{ver['version']}`\n\n"
                 f"🔄 Active: `{stat['numActive']}`\n"
                 f"⏳ Waiting: `{stat['numWaiting']}`\n"
-                f"⚡ Speed: `{fmt_speed(int(stat['downloadSpeed']))}`",
+                f"⚡ Speed: `{fmt_speed(int(stat['downloadSpeed']))}`\n\n"
+                f"**Configured Accounts ({len(TB_ACCOUNTS)}):**\n{accounts_info}",
                 reply_to_message_id=message.id,
             )
         except Exception as e:
@@ -517,7 +602,6 @@ def register(app: Client):
                 reply_to_message_id=message.id,
             )
 
-    # ── Text messages ──────────────────────────────────────────
     @app.on_message(filters.text & filters.private & ~filters.command(["start", "status"]))
     async def on_text(client: Client, message: Message):
         links = extract_links(message.text or "")
@@ -531,7 +615,6 @@ def register(app: Client):
             return
         await handle_links(client, message, links)
 
-    # ── Media messages (photo / video / document / audio) ─────
     @app.on_message(
         filters.private &
         (filters.photo | filters.video | filters.document | filters.audio) &
@@ -550,15 +633,15 @@ def register(app: Client):
         await handle_links(client, message, links)
 
 # ─────────────────────────────────────────────────────────────
-# 7. MAIN
+# 8. MAIN
 # ─────────────────────────────────────────────────────────────
 
 async def main():
     log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     log.info("🤖 TeraBox Bot starting...")
-    log.info("TB_ACCOUNT : %s", TB_ACCOUNT)
-    log.info("CHANNEL_ID : %d", CHANNEL_ID)
-    log.info("ARIA2_URL  : %s", ARIA2_URL)
+    log.info("TB_ACCOUNTS : %s", TB_ACCOUNTS)
+    log.info("CHANNEL_ID  : %d", CHANNEL_ID)
+    log.info("ARIA2_URL   : %s", ARIA2_URL)
 
     try:
         ver = await aria2_ping()
