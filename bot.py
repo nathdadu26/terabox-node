@@ -188,8 +188,23 @@ def delete_file(path: str):
 
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
-# Error #400141 — account rate limited / needs rotation
-ERROR_400141_RE = re.compile(r"Error\s*#?400141", re.IGNORECASE)
+# Errors that trigger account rotation (account-specific issues)
+ROTATION_ERRORS = [
+    re.compile(r"Error\s*#?400141",           re.IGNORECASE),  # rate limited
+    re.compile(r'"ndus"\s*cookie\s*is\s*BAD', re.IGNORECASE), # bad/expired cookie
+    re.compile(r'cookie.*bad',                 re.IGNORECASE),
+    re.compile(r'bad.*cookie',                 re.IGNORECASE),
+    re.compile(r'invalid.*cookie',             re.IGNORECASE),
+    re.compile(r'cookie.*invalid',             re.IGNORECASE),
+    re.compile(r'cookie.*expired',             re.IGNORECASE),
+    re.compile(r'login.*required',             re.IGNORECASE),
+    re.compile(r'not.*logged.*in',             re.IGNORECASE),
+    re.compile(r"Error\s*#?401",               re.IGNORECASE),  # unauthorized
+]
+
+def _is_rotation_error(text: str) -> bool:
+    """Return True if the error output means this account should be rotated."""
+    return any(p.search(text) for p in ROTATION_ERRORS)
 
 def extract_links(text: str) -> list[str]:
     if not text:
@@ -241,13 +256,19 @@ async def _run_tb(share_url: str, account: str) -> str:
     if err.strip(): log.warning("[tb stderr] %s", err.strip())
 
     if proc.returncode not in (0, None):
-        # Check for error 400141 specifically
-        if ERROR_400141_RE.search(combined):
-            raise ValueError(f"400141: Account '{account}' hit error #400141")
+        # Check if this is an account-specific error (rotate) or a real error (fail)
+        if _is_rotation_error(combined):
+            log.warning("Rotation error detected for account '%s': %s", account, combined[:120])
+            raise ValueError(f"ROTATION: Account '{account}' needs rotation\n{combined[:200]}")
         raise RuntimeError(
             f"tb-getdl-share failed (exit {proc.returncode}) with account '{account}'"
             + (f"\n{err.strip()}" if err.strip() else "")
         )
+
+    # Also check stdout/stderr even on exit code 0 — some errors don't set exit code
+    if _is_rotation_error(combined):
+        log.warning("Rotation error in output (exit 0) for account '%s': %s", account, combined[:120])
+        raise ValueError(f"ROTATION: Account '{account}' needs rotation\n{combined[:200]}")
 
     return combined
 
@@ -292,9 +313,9 @@ async def download_with_rotation(
         try:
             await _run_tb(share_url, account)
         except ValueError as e:
-            # Error 400141 — rotate to next account
+            # Rotation error — try next account
             last_error = str(e)
-            log.warning("Account '%s' got error 400141, rotating... (%d/%d)", account, attempt, len(accounts))
+            log.warning("Account '%s' needs rotation (%d/%d): %s", account, attempt, len(accounts), str(e)[:80])
 
             if attempt < len(accounts):
                 next_account = accounts[attempt]  # attempt is 1-based, so this is next index
@@ -306,8 +327,8 @@ async def download_with_rotation(
                 continue  # try next account
             else:
                 raise AccountRotationError(
-                    f"All {len(accounts)} account(s) failed with error #400141.\n"
-                    f"Please try again later or add more accounts."
+                    f"All {len(accounts)} account(s) failed (cookie/auth error).\n"
+                    f"Please refresh your account cookies and try again."
                 )
         except RuntimeError:
             # Any other error — don't rotate, raise immediately
@@ -414,7 +435,7 @@ async def process_single_link(
     async def on_account_switch(old: str, new: str, attempt: int, total: int):
         await safe_edit(status_msg,
             f"{prefix}🔄 **Switching account...**\n\n"
-            f"Account `{old}` hit error #400141\n"
+            f"Account `{old}` has a cookie/auth issue\n"
             f"Trying account `{new}` ({attempt + 1}/{total})..."
         )
 
