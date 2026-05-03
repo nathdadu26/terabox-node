@@ -190,21 +190,26 @@ URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
 # Errors that trigger account rotation (account-specific issues)
 ROTATION_ERRORS = [
-    re.compile(r"Error\s*#?400141",           re.IGNORECASE),  # rate limited
-    re.compile(r'"ndus"\s*cookie\s*is\s*BAD', re.IGNORECASE), # bad/expired cookie
-    re.compile(r'cookie.*bad',                 re.IGNORECASE),
-    re.compile(r'bad.*cookie',                 re.IGNORECASE),
-    re.compile(r'invalid.*cookie',             re.IGNORECASE),
-    re.compile(r'cookie.*invalid',             re.IGNORECASE),
-    re.compile(r'cookie.*expired',             re.IGNORECASE),
-    re.compile(r'login.*required',             re.IGNORECASE),
-    re.compile(r'not.*logged.*in',             re.IGNORECASE),
-    re.compile(r"Error\s*#?401",               re.IGNORECASE),  # unauthorized
+    re.compile(r"Error\s*#?400141",      re.IGNORECASE),  # rate limited
+    re.compile(r"ndus.*cookie.*bad",      re.IGNORECASE),  # bad ndus cookie (any quote style)
+    re.compile(r"cookie.*is.*bad",        re.IGNORECASE),  # generic cookie bad
+    re.compile(r"cookie.*bad",            re.IGNORECASE),
+    re.compile(r"bad.*cookie",            re.IGNORECASE),
+    re.compile(r"invalid.*cookie",        re.IGNORECASE),
+    re.compile(r"cookie.*invalid",        re.IGNORECASE),
+    re.compile(r"cookie.*expired",        re.IGNORECASE),
+    re.compile(r"login.*required",        re.IGNORECASE),
+    re.compile(r"not.*logged.*in",        re.IGNORECASE),
+    re.compile(r"Error\s*#?401",         re.IGNORECASE),  # unauthorized
+    re.compile(r"\[ERROR\]",            re.IGNORECASE),  # any [ERROR] from tb tool
 ]
 
 def _is_rotation_error(text: str) -> bool:
     """Return True if the error output means this account should be rotated."""
-    return any(p.search(text) for p in ROTATION_ERRORS)
+    matched = any(p.search(text) for p in ROTATION_ERRORS)
+    if matched:
+        log.warning("_is_rotation_error matched in: %s", text[:150])
+    return matched
 
 def extract_links(text: str) -> list[str]:
     if not text:
@@ -255,20 +260,17 @@ async def _run_tb(share_url: str, account: str) -> str:
     if out.strip(): log.info("[tb stdout] %s", out.strip())
     if err.strip(): log.warning("[tb stderr] %s", err.strip())
 
+    # Check rotation errors FIRST — regardless of exit code
+    # tb-getdl-share often exits 0 even on cookie/auth errors
+    if _is_rotation_error(combined):
+        log.warning("Rotation error for account '%s' (exit=%s)", account, proc.returncode)
+        raise ValueError(f"ROTATION: Account '{account}' needs rotation\n{combined[:300]}")
+
     if proc.returncode not in (0, None):
-        # Check if this is an account-specific error (rotate) or a real error (fail)
-        if _is_rotation_error(combined):
-            log.warning("Rotation error detected for account '%s': %s", account, combined[:120])
-            raise ValueError(f"ROTATION: Account '{account}' needs rotation\n{combined[:200]}")
         raise RuntimeError(
             f"tb-getdl-share failed (exit {proc.returncode}) with account '{account}'"
             + (f"\n{err.strip()}" if err.strip() else "")
         )
-
-    # Also check stdout/stderr even on exit code 0 — some errors don't set exit code
-    if _is_rotation_error(combined):
-        log.warning("Rotation error in output (exit 0) for account '%s': %s", account, combined[:120])
-        raise ValueError(f"ROTATION: Account '{account}' needs rotation\n{combined[:200]}")
 
     return combined
 
