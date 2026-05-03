@@ -1,4 +1,4 @@
-# bot.py — TeraBox Telegram Bot (English, Full Featured)
+# bot.py — TeraBox Telegram Bot (Full Featured)
 
 import asyncio
 import logging
@@ -11,7 +11,9 @@ from typing import Optional, Callable, Awaitable
 import aiohttp
 from dotenv import load_dotenv
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import (
+    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+)
 
 # ─────────────────────────────────────────────────────────────
 # 0. ENV
@@ -28,17 +30,15 @@ def _req(key: str) -> str:
 BOT_TOKEN         = _req("BOT_TOKEN")
 API_ID            = int(_req("API_ID"))
 API_HASH          = _req("API_HASH")
-CHANNEL_ID        = int(_req("CHANNEL_ID"))
+CHANNEL_ID        = int(_req("CHANNEL_ID"))       # private storage channel
+UPDATE_CHANNEL    = _req("UPDATE_CHANNEL")         # e.g. "@myupdates" or "-100xxx"
+LOG_CHANNEL       = int(_req("LOG_CHANNEL"))       # log channel id
 ARIA2_URL         = os.getenv("ARIA2_URL", "http://localhost:6800/jsonrpc")
 ARIA2_SECRET      = os.getenv("ARIA2_SECRET", "")
 PROGRESS_INTERVAL = int(os.getenv("PROGRESS_INTERVAL", "5"))
 
-# ── Account rotation ──────────────────────────────────────────
-# TB_ACCOUNTS = "main,second,third,fourth,fifth"  (comma separated)
-# Fallback: TB_ACCOUNT = "main"  (old single-account env)
 _accounts_raw = os.getenv("TB_ACCOUNTS", "") or os.getenv("TB_ACCOUNT", "main")
 TB_ACCOUNTS: list[str] = [a.strip() for a in _accounts_raw.split(",") if a.strip()]
-log_placeholder = None  # set after logging init
 
 # ─────────────────────────────────────────────────────────────
 # 1. LOGGING
@@ -58,7 +58,7 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 logging.getLogger("aiohttp").setLevel(logging.WARNING)
 
 # ─────────────────────────────────────────────────────────────
-# 2. UPLOAD LOCK  (one upload at a time — Telegram limit)
+# 2. GLOBALS
 # ─────────────────────────────────────────────────────────────
 
 _upload_lock = asyncio.Lock()
@@ -74,28 +74,21 @@ async def _rpc(method: str, params: list = None):
     _rpc_id += 1
     params = params or []
     rpc_params = ([f"token:{ARIA2_SECRET}"] + params) if ARIA2_SECRET else params
-
     body = {
         "jsonrpc": "2.0",
         "id": str(_rpc_id),
         "method": f"aria2.{method}",
         "params": rpc_params,
     }
-
     try:
         async with aiohttp.ClientSession() as s:
             async with s.post(
-                ARIA2_URL,
-                json=body,
+                ARIA2_URL, json=body,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as r:
                 data = await r.json(content_type=None)
     except aiohttp.ClientConnectorError:
-        raise ConnectionError(
-            f"Cannot connect to Aria2: {ARIA2_URL}\n"
-            "Make sure `aria2c --enable-rpc` is running."
-        )
-
+        raise ConnectionError(f"Cannot connect to Aria2: {ARIA2_URL}")
     if "error" in data:
         raise RuntimeError(f"Aria2 RPC [{method}]: {data['error']['message']}")
     return data["result"]
@@ -182,33 +175,31 @@ def delete_file(path: str):
     try:
         if path and os.path.exists(path):
             os.remove(path)
-            log.info("🗑️  Deleted temp file: %s", path)
+            log.info("🗑️  Deleted: %s", path)
     except Exception as e:
-        log.warning("Could not delete file %s: %s", path, e)
+        log.warning("Could not delete %s: %s", path, e)
 
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
-# Errors that trigger account rotation (account-specific issues)
 ROTATION_ERRORS = [
-    re.compile(r"Error\s*#?400141",      re.IGNORECASE),  # rate limited
-    re.compile(r"ndus.*cookie.*bad",      re.IGNORECASE),  # bad ndus cookie (any quote style)
-    re.compile(r"cookie.*is.*bad",        re.IGNORECASE),  # generic cookie bad
-    re.compile(r"cookie.*bad",            re.IGNORECASE),
-    re.compile(r"bad.*cookie",            re.IGNORECASE),
-    re.compile(r"invalid.*cookie",        re.IGNORECASE),
-    re.compile(r"cookie.*invalid",        re.IGNORECASE),
-    re.compile(r"cookie.*expired",        re.IGNORECASE),
-    re.compile(r"login.*required",        re.IGNORECASE),
-    re.compile(r"not.*logged.*in",        re.IGNORECASE),
-    re.compile(r"Error\s*#?401",         re.IGNORECASE),  # unauthorized
-    re.compile(r"\[ERROR\]",            re.IGNORECASE),  # any [ERROR] from tb tool
+    re.compile(r"Error\s*#?400141",     re.IGNORECASE),
+    re.compile(r"ndus.*cookie.*bad",    re.IGNORECASE),
+    re.compile(r"cookie.*is.*bad",      re.IGNORECASE),
+    re.compile(r"cookie.*bad",          re.IGNORECASE),
+    re.compile(r"bad.*cookie",          re.IGNORECASE),
+    re.compile(r"invalid.*cookie",      re.IGNORECASE),
+    re.compile(r"cookie.*invalid",      re.IGNORECASE),
+    re.compile(r"cookie.*expired",      re.IGNORECASE),
+    re.compile(r"login.*required",      re.IGNORECASE),
+    re.compile(r"not.*logged.*in",      re.IGNORECASE),
+    re.compile(r"Error\s*#?401",        re.IGNORECASE),
+    re.compile(r"\[ERROR\]",            re.IGNORECASE),
 ]
 
 def _is_rotation_error(text: str) -> bool:
-    """Return True if the error output means this account should be rotated."""
     matched = any(p.search(text) for p in ROTATION_ERRORS)
     if matched:
-        log.warning("_is_rotation_error matched in: %s", text[:150])
+        log.warning("Rotation error matched: %s", text[:150])
     return matched
 
 def extract_links(text: str) -> list[str]:
@@ -219,7 +210,77 @@ def extract_links(text: str) -> list[str]:
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".m4v", ".ts"}
 
 # ─────────────────────────────────────────────────────────────
-# 5. DOWNLOADER  (with account rotation on 400141)
+# 5. JOIN VERIFICATION
+# ─────────────────────────────────────────────────────────────
+
+def join_keyboard() -> InlineKeyboardMarkup:
+    """Buttons: Join channel + I have joined."""
+    channel = UPDATE_CHANNEL if UPDATE_CHANNEL.startswith("@") else f"https://t.me/c/{str(UPDATE_CHANNEL).replace('-100', '')}"
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📢 Join Update Channel", url=f"https://t.me/{UPDATE_CHANNEL.lstrip('@')}"),
+            InlineKeyboardButton("✅ I Have Joined", callback_data="check_join"),
+        ]
+    ])
+
+async def is_member(client: Client, user_id: int) -> bool:
+    """Check if user is a member of UPDATE_CHANNEL."""
+    try:
+        member = await client.get_chat_member(UPDATE_CHANNEL, user_id)
+        return member.status.name not in ("LEFT", "BANNED", "KICKED", "RESTRICTED")
+    except Exception as e:
+        log.warning("Membership check failed for %d: %s", user_id, e)
+        return False
+
+async def force_join_message(client: Client, message: Message):
+    """Send the force-join prompt as a reply to the user's message."""
+    first = message.from_user.first_name
+    await message.reply_text(
+        f"Hello! **{first}** 👋\n\n"
+        f"Please join our Update Channel to use me!\n\n"
+        f"After joining, click **I Have Joined** ✅",
+        reply_markup=join_keyboard(),
+        reply_to_message_id=message.id,
+    )
+
+# ─────────────────────────────────────────────────────────────
+# 6. LOG CHANNEL HELPERS
+# ─────────────────────────────────────────────────────────────
+
+async def log_start(client: Client, user: object):
+    """Log new /start to log channel."""
+    try:
+        await client.send_message(
+            LOG_CHANNEL,
+            f"👤 **New User Started Bot**\n\n"
+            f"Name: [{user.first_name}](tg://user?id={user.id})\n"
+            f"Username: @{user.username or 'N/A'}\n"
+            f"ID: `{user.id}`",
+        )
+    except Exception as e:
+        log.warning("log_start failed: %s", e)
+
+async def log_link(client: Client, user: object, original_msg: Message, links: list[str]) -> Optional[Message]:
+    """
+    Forward user's original message to log channel.
+    Returns the forwarded message (used later to reply with uploaded file).
+    """
+    try:
+        fwd = await original_msg.forward(LOG_CHANNEL)
+        await client.send_message(
+            LOG_CHANNEL,
+            f"🔗 **Link Request**\n"
+            f"From: [{user.first_name}](tg://user?id={user.id}) | `{user.id}`\n"
+            f"Links: `{len(links)}`",
+            reply_to_message_id=fwd.id,
+        )
+        return fwd
+    except Exception as e:
+        log.warning("log_link failed: %s", e)
+        return None
+
+# ─────────────────────────────────────────────────────────────
+# 7. DOWNLOADER  (with account rotation)
 # ─────────────────────────────────────────────────────────────
 
 @dataclass
@@ -231,18 +292,10 @@ class DownloadResult:
 
 
 class AccountRotationError(Exception):
-    """Raised when all accounts fail with error 400141."""
     pass
 
 
 async def _run_tb(share_url: str, account: str) -> str:
-    """
-    Run tb-getdl-share for a given account.
-    Returns combined stderr output.
-    Raises RuntimeError on non-zero exit.
-    Special: raises ValueError with '400141' if that specific error is detected,
-             so the caller can rotate accounts.
-    """
     cmd = ["tb-getdl-share", "-a", account, "-s", share_url]
     log.info("Running: %s", " ".join(cmd))
 
@@ -261,7 +314,6 @@ async def _run_tb(share_url: str, account: str) -> str:
     if err.strip(): log.warning("[tb stderr] %s", err.strip())
 
     # Check rotation errors FIRST — regardless of exit code
-    # tb-getdl-share often exits 0 even on cookie/auth errors
     if _is_rotation_error(combined):
         log.warning("Rotation error for account '%s' (exit=%s)", account, proc.returncode)
         raise ValueError(f"ROTATION: Account '{account}' needs rotation\n{combined[:300]}")
@@ -297,11 +349,6 @@ async def download_with_rotation(
     on_progress: Optional[Callable[[Aria2Status], Awaitable[None]]] = None,
     on_account_switch: Optional[Callable[[str, str, int, int], Awaitable[None]]] = None,
 ) -> DownloadResult:
-    """
-    Try each TB account in order.
-    Only rotates on error #400141 — other errors raise immediately.
-    on_account_switch(old_account, new_account, attempt, total) callback for UI updates.
-    """
     accounts = TB_ACCOUNTS
     if not accounts:
         raise RuntimeError("No TB accounts configured! Set TB_ACCOUNTS env variable.")
@@ -315,28 +362,25 @@ async def download_with_rotation(
         try:
             await _run_tb(share_url, account)
         except ValueError as e:
-            # Rotation error — try next account
             last_error = str(e)
-            log.warning("Account '%s' needs rotation (%d/%d): %s", account, attempt, len(accounts), str(e)[:80])
-
+            log.warning("Account '%s' rotating (%d/%d)", account, attempt, len(accounts))
             if attempt < len(accounts):
-                next_account = accounts[attempt]  # attempt is 1-based, so this is next index
+                next_account = accounts[attempt]
                 if on_account_switch:
                     try:
                         await on_account_switch(account, next_account, attempt, len(accounts))
                     except Exception:
                         pass
-                continue  # try next account
+                continue
             else:
                 raise AccountRotationError(
                     f"All {len(accounts)} account(s) failed (cookie/auth error).\n"
                     f"Please refresh your account cookies and try again."
                 )
         except RuntimeError:
-            # Any other error — don't rotate, raise immediately
             raise
 
-        # tb-getdl-share succeeded — now wait for GID and download
+        # Download succeeded — wait for GID
         gid = await _find_new_gid(before)
 
         last_cb = 0.0
@@ -376,7 +420,7 @@ async def download_with_rotation(
     raise AccountRotationError(f"All accounts exhausted. Last error: {last_error}")
 
 # ─────────────────────────────────────────────────────────────
-# 6. CORE PROCESSOR
+# 8. CORE PROCESSOR
 # ─────────────────────────────────────────────────────────────
 
 async def safe_edit(msg: Message, text: str):
@@ -401,6 +445,7 @@ async def process_single_link(
     link: str,
     link_index: int,
     total_links: int,
+    log_msg: Optional[Message] = None,   # forwarded msg in log channel
 ) -> bool:
     prefix = f"**[{link_index}/{total_links}]** " if total_links > 1 else ""
 
@@ -409,10 +454,7 @@ async def process_single_link(
         await aria2_ping()
     except Exception as e:
         await safe_edit(status_msg,
-            f"{prefix}❌ **Cannot connect to Aria2!**\n\n"
-            f"`{e}`\n\n"
-            f"Please try again later."
-        )
+            f"{prefix}❌ **Cannot connect to Aria2!**\n\n`{e}`\n\nPlease try again later.")
         return False
 
     await safe_edit(status_msg,
@@ -420,7 +462,6 @@ async def process_single_link(
         f"`{link[:60]}{'...' if len(link) > 60 else ''}`"
     )
 
-    # Progress callback
     async def on_progress(s: Aria2Status):
         bar = progress_bar(s.percent)
         eta = eta_str(s.completed_length, s.total_length, s.download_speed)
@@ -433,7 +474,6 @@ async def process_single_link(
             f"_GID: {s.gid}_"
         )
 
-    # Account switch callback
     async def on_account_switch(old: str, new: str, attempt: int, total: int):
         await safe_edit(status_msg,
             f"{prefix}🔄 **Switching account...**\n\n"
@@ -441,17 +481,13 @@ async def process_single_link(
             f"Trying account `{new}` ({attempt + 1}/{total})..."
         )
 
-    # Download (with account rotation)
     result = None
     try:
         result = await download_with_rotation(link, on_progress, on_account_switch)
     except AccountRotationError as e:
         log.error("All accounts failed for %s: %s", link, e)
         await safe_edit(status_msg,
-            f"{prefix}❌ **All Accounts Failed**\n\n"
-            f"`{e}`\n\n"
-            f"Please try again later."
-        )
+            f"{prefix}❌ **All Accounts Failed**\n\n`{e}`\n\nPlease try again later.")
         return False
     except RuntimeError as e:
         log.error("Download failed for %s: %s", link, e)
@@ -459,18 +495,15 @@ async def process_single_link(
             f"{prefix}❌ **Download Failed**\n\n"
             f"**Reason:** `{e}`\n\n"
             f"**Link:** `{link[:80]}`\n\n"
-            f"Please check if the link is valid and try again."
-        )
+            f"Please check if the link is valid and try again.")
         return False
     except Exception as e:
         log.exception("Unexpected error downloading %s", link)
         await safe_edit(status_msg,
-            f"{prefix}❌ **Unexpected Error**\n\n"
-            f"`{type(e).__name__}: {e}`"
-        )
+            f"{prefix}❌ **Unexpected Error**\n\n`{type(e).__name__}: {e}`")
         return False
 
-    # Upload to channel — sequential lock (one at a time)
+    # Upload — sequential lock
     await safe_edit(status_msg,
         f"{prefix}✅ **Download Complete!**\n\n"
         f"📁 `{result.file_name}`\n"
@@ -487,10 +520,8 @@ async def process_single_link(
         )
         try:
             ext = os.path.splitext(result.file_name)[1].lower()
-            caption = (
-                f"📁 **{result.file_name}**\n"
-                f"📦 `{fmt_bytes(result.total_size)}`"
-            )
+            caption = f"📁 **{result.file_name}**\n📦 `{fmt_bytes(result.total_size)}`"
+
             if ext in VIDEO_EXTS:
                 channel_msg = await client.send_video(
                     CHANNEL_ID, result.file_path,
@@ -498,28 +529,32 @@ async def process_single_link(
                 )
             else:
                 channel_msg = await client.send_document(
-                    CHANNEL_ID, result.file_path,
-                    caption=caption,
+                    CHANNEL_ID, result.file_path, caption=caption,
                 )
+
+            # Post to log channel as reply to forwarded user message
+            if log_msg:
+                try:
+                    await client.copy_message(
+                        LOG_CHANNEL, CHANNEL_ID, channel_msg.id,
+                        reply_to_message_id=log_msg.id,
+                    )
+                except Exception as e:
+                    log.warning("Log channel upload copy failed: %s", e)
+
         except Exception as e:
             log.exception("Upload failed for %s", result.file_name)
             await safe_edit(status_msg,
-                f"{prefix}✅ Downloaded\n"
-                f"❌ **Upload Failed**\n\n"
-                f"**Error:** `{e}`\n\n"
-                f"**File:** `{result.file_name}`"
-            )
+                f"{prefix}✅ Downloaded\n❌ **Upload Failed**\n\n"
+                f"**Error:** `{e}`\n**File:** `{result.file_name}`")
             delete_file(result.file_path)
             return False
         finally:
             delete_file(result.file_path)
 
-    # Copy to user
+    # Copy to user — reply to their original message
     await safe_edit(status_msg,
-        f"{prefix}✅ **Done!**\n"
-        f"📁 `{result.file_name}`\n\n"
-        f"File incoming 👇"
-    )
+        f"{prefix}✅ **Done!**\n📁 `{result.file_name}`\n\nFile incoming 👇")
     try:
         await client.copy_message(
             original_message.chat.id,
@@ -546,6 +581,9 @@ async def handle_links(client: Client, message: Message, links: list[str]):
     if not links:
         return
 
+    # Log to log channel — forward user's message
+    log_msg = await log_link(client, user, message, links)
+
     status_msg = await message.reply_text(
         f"🔍 Found **{len(links)}** link(s). Starting...",
         reply_to_message_id=message.id,
@@ -556,7 +594,9 @@ async def handle_links(client: Client, message: Message, links: list[str]):
     failed  = 0
 
     for i, link in enumerate(links, 1):
-        ok = await process_single_link(client, message, status_msg, link, i, len(links))
+        ok = await process_single_link(
+            client, message, status_msg, link, i, len(links), log_msg
+        )
         if ok:
             success += 1
         else:
@@ -579,31 +619,61 @@ async def handle_links(client: Client, message: Message, links: list[str]):
             pass
 
 # ─────────────────────────────────────────────────────────────
-# 7. BOT HANDLERS
+# 9. BOT HANDLERS
 # ─────────────────────────────────────────────────────────────
 
 def register(app: Client):
 
+    # ── /start ────────────────────────────────────────────────
     @app.on_message(filters.command("start") & filters.private)
-    async def cmd_start(_, message: Message):
-        accounts_info = f"`{'`, `'.join(TB_ACCOUNTS)}`" if TB_ACCOUNTS else "_none configured_"
-        await message.reply_text(
-            "🤖 **TeraBox Downloader Bot**\n\n"
-            "Send any TeraBox / cloud share link!\n\n"
-            "**Supported:**\n"
-            "➤ Text messages with links\n"
-            "➤ Media with links in caption\n"
-            "➤ Multiple links — all processed!\n"
-            "➤ Auto account rotation on errors\n\n"
-            f"**Active accounts:** {accounts_info}\n\n"
-            "**Example:**\n"
-            "`https://terabox.com/s/xxxxxxxxxx`\n\n"
-            "/status — Check Aria2 & accounts",
-            reply_to_message_id=message.id,
-        )
+    async def cmd_start(client: Client, message: Message):
+        user = message.from_user
+        first = user.first_name
 
+        # Log new start
+        await log_start(client, user)
+
+        # Check membership
+        if await is_member(client, user.id):
+            await message.reply_text(
+                f"Welcome back **{first}**! 👋\n\n"
+                f"Send any TeraBox link to download it.\n"
+                f"It also supports folders! 📂",
+                reply_to_message_id=message.id,
+            )
+        else:
+            await message.reply_text(
+                f"Hello! **{first}** 👋\n\n"
+                f"Please join our Update Channel to use me!\n\n"
+                f"After joining, click **I Have Joined** ✅",
+                reply_markup=join_keyboard(),
+                reply_to_message_id=message.id,
+            )
+
+    # ── Callback: I Have Joined ───────────────────────────────
+    @app.on_callback_query(filters.regex("^check_join$"))
+    async def cb_check_join(client: Client, query: CallbackQuery):
+        user = query.from_user
+        if await is_member(client, user.id):
+            await query.message.edit_text(
+                f"Welcome back **{user.first_name}**! 👋\n\n"
+                f"Send any TeraBox link to download it.\n"
+                f"It also supports folders! 📂"
+            )
+            await query.answer("✅ Verified! You can now use the bot.", show_alert=False)
+        else:
+            await query.answer(
+                "❌ You haven't joined yet!\nPlease join the channel first.",
+                show_alert=True,
+            )
+
+    # ── /status ───────────────────────────────────────────────
     @app.on_message(filters.command("status") & filters.private)
-    async def cmd_status(_, message: Message):
+    async def cmd_status(client: Client, message: Message):
+        # Check membership first
+        if not await is_member(client, message.from_user.id):
+            await force_join_message(client, message)
+            return
         try:
             ver  = await aria2_ping()
             stat = await aria2_global_stat()
@@ -625,8 +695,14 @@ def register(app: Client):
                 reply_to_message_id=message.id,
             )
 
+    # ── Text messages ─────────────────────────────────────────
     @app.on_message(filters.text & filters.private & ~filters.command(["start", "status"]))
     async def on_text(client: Client, message: Message):
+        # Check membership
+        if not await is_member(client, message.from_user.id):
+            await force_join_message(client, message)
+            return
+
         links = extract_links(message.text or "")
         if not links:
             await message.reply_text(
@@ -638,12 +714,18 @@ def register(app: Client):
             return
         await handle_links(client, message, links)
 
+    # ── Media messages ────────────────────────────────────────
     @app.on_message(
         filters.private &
         (filters.photo | filters.video | filters.document | filters.audio) &
         ~filters.command(["start", "status"])
     )
     async def on_media(client: Client, message: Message):
+        # Check membership
+        if not await is_member(client, message.from_user.id):
+            await force_join_message(client, message)
+            return
+
         caption = message.caption or ""
         links = extract_links(caption)
         if not links:
@@ -656,15 +738,17 @@ def register(app: Client):
         await handle_links(client, message, links)
 
 # ─────────────────────────────────────────────────────────────
-# 8. MAIN
+# 10. MAIN
 # ─────────────────────────────────────────────────────────────
 
 async def main():
     log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     log.info("🤖 TeraBox Bot starting...")
-    log.info("TB_ACCOUNTS : %s", TB_ACCOUNTS)
-    log.info("CHANNEL_ID  : %d", CHANNEL_ID)
-    log.info("ARIA2_URL   : %s", ARIA2_URL)
+    log.info("TB_ACCOUNTS    : %s", TB_ACCOUNTS)
+    log.info("CHANNEL_ID     : %d", CHANNEL_ID)
+    log.info("UPDATE_CHANNEL : %s", UPDATE_CHANNEL)
+    log.info("LOG_CHANNEL    : %d", LOG_CHANNEL)
+    log.info("ARIA2_URL      : %s", ARIA2_URL)
 
     try:
         ver = await aria2_ping()
